@@ -1,4 +1,5 @@
 use std::io::Write;
+
 use tokenizers::Tokenizer;
 
 use candle_core::quantized::gguf_file;
@@ -6,19 +7,7 @@ use candle_core::Tensor;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::quantized_llama::ModelWeights as Phi3b;
-use candle_transformers::models::quantized_phi::ModelWeights as Phi2;
 use candle_transformers::models::quantized_phi3::ModelWeights as Phi3;
-
-const DEFAULT_PROMPT: &str = "こんにちは！";
-
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
-enum Which {
-    Phi2,
-    Phi3,
-    Phi3b,
-    Phi4,
-}
 
 #[derive(Debug)]
 struct Args {
@@ -53,69 +42,6 @@ struct Args {
 
     /// Process prompt elements separately.
     split_prompt: bool,
-
-    /// Run on CPU rather than GPU even if a GPU is available.
-    cpu: bool,
-
-    /// Penalty to be applied for repeating tokens, 1. means no penalty.
-    repeat_penalty: f32,
-
-    /// The context size to consider for the repeat penalty.
-    repeat_last_n: usize,
-
-    /// The model size to use.
-    which: Which,
-
-    use_flash_attn: bool,
-}
-
-impl Args {
-    fn tokenizer(&self) -> anyhow::Result<Tokenizer> {
-        let tokenizer_path = match &self.tokenizer {
-            Some(config) => std::path::PathBuf::from(config),
-            None => {
-                let api = hf_hub::api::sync::Api::new()?;
-                let repo = match self.which {
-                    Which::Phi2 => "microsoft/phi-2",
-                    Which::Phi3 | Which::Phi3b => "microsoft/Phi-3-mini-4k-instruct",
-                    Which::Phi4 => "microsoft/phi-4",
-                };
-                let api = api.model(repo.to_string());
-                api.get("tokenizer.json")?
-            }
-        };
-        Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)
-    }
-
-    fn model(&self) -> anyhow::Result<std::path::PathBuf> {
-        let model_path = match &self.model {
-            Some(config) => std::path::PathBuf::from(config),
-            None => {
-                let (repo, filename, revision) = match self.which {
-                    Which::Phi2 => ("TheBloke/phi-2-GGUF", "phi-2.Q4_K_M.gguf", "main"),
-                    Which::Phi3 => (
-                        "microsoft/Phi-3-mini-4k-instruct-gguf",
-                        "Phi-3-mini-4k-instruct-q4.gguf",
-                        "main",
-                    ),
-                    Which::Phi3b => (
-                        "microsoft/Phi-3-mini-4k-instruct-gguf",
-                        "Phi-3-mini-4k-instruct-q4.gguf",
-                        "5eef2ce24766d31909c0b269fe90c817a8f263fb",
-                    ),
-                    Which::Phi4 => ("microsoft/phi-4-gguf", "phi-4-q4.gguf", "main"),
-                };
-                let api = hf_hub::api::sync::Api::new()?;
-                api.repo(hf_hub::Repo::with_revision(
-                    repo.to_string(),
-                    hf_hub::RepoType::Model,
-                    revision.to_string(),
-                ))
-                .get(filename)?
-            }
-        };
-        Ok(model_path)
-    }
 }
 
 fn format_size(size_in_bytes: usize) -> String {
@@ -130,51 +56,17 @@ fn format_size(size_in_bytes: usize) -> String {
     }
 }
 
-enum Model {
-    Phi2(Phi2),
-    Phi3(Phi3),
-    Phi3b(Phi3b),
-}
-
-impl Model {
-    fn forward(&mut self, xs: &Tensor, pos: usize) -> candle_core::Result<Tensor> {
-        match self {
-            Self::Phi2(m) => m.forward(xs, pos),
-            Self::Phi3(m) => m.forward(xs, pos),
-            Self::Phi3b(m) => m.forward(xs, pos),
-        }
-    }
-}
-
 pub fn main() -> anyhow::Result<()> {
-    use tracing_chrome::ChromeLayerBuilder;
-    use tracing_subscriber::prelude::*;
 
-    let args = Args {
-        model: None,
-        prompt: None,
-        sample_len: 100,
-        tokenizer: None,
-        temperature: 0.7,
-        top_p: None,
-        top_k: None,
-        seed: 42,
-        tracing: false,
-        split_prompt: false,
-        cpu: false,
-        repeat_penalty: 1.,
-        repeat_last_n: 10,
-        which: Which::Phi4,
-        use_flash_attn: false,
-    };
+    let temperature = 0.8;
+    let repeat_penalty = 1.0;
+    let repeat_last_n = 10;
 
-    let _guard = if args.tracing {
-        let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
-        tracing_subscriber::registry().with(chrome_layer).init();
-        Some(guard)
-    } else {
-        None
-    };
+    let flash_attn = false;
+    let seed = 42;
+    let sample_len = 100u64;
+
+    let cpu = false;
 
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
@@ -185,13 +77,18 @@ pub fn main() -> anyhow::Result<()> {
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
-        args.temperature, args.repeat_penalty, args.repeat_last_n
+        temperature, repeat_penalty, repeat_last_n
     );
+    
 
-    let model_path = args.model()?;
+    let model_path = hf_hub::api::sync::Api::new()?
+        .repo(hf_hub::Repo::with_revision("microsoft/phi-4-gguf".to_string(),hf_hub::RepoType::Model,"main".to_string()))
+        .get("phi-4-q4.gguf")?
+        ;
+
     let mut file = std::fs::File::open(&model_path)?;
     let start = std::time::Instant::now();
-    let device = candle_examples::device(args.cpu)?;
+    let device = candle_examples::device(cpu)?;
 
     let mut model = {
         let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
@@ -207,122 +104,102 @@ pub fn main() -> anyhow::Result<()> {
             &format_size(total_size_in_bytes),
             start.elapsed().as_secs_f32(),
         );
-        match args.which {
-            Which::Phi2 => Model::Phi2(Phi2::from_gguf(model, &mut file, &device)?),
-            Which::Phi3 | Which::Phi4 => Model::Phi3(Phi3::from_gguf(
-                args.use_flash_attn,
-                model,
-                &mut file,
-                &device,
-            )?),
-            Which::Phi3b => Model::Phi3b(Phi3b::from_gguf(model, &mut file, &device)?),
-        }
+        Phi3::from_gguf(
+            flash_attn,
+            model,
+            &mut file,
+            &device,
+        )?
     };
     println!("model built");
 
-    let tokenizer = args.tokenizer()?;
+    let tokenizer = Tokenizer::from_file(hf_hub::api::sync::Api::new()?.model("microsoft/phi-4".to_string()).get("tokenizer.json")?).unwrap();
     let mut tos = TokenOutputStream::new(tokenizer);
-    let prompt_str = args.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string());
-    print!("{}", &prompt_str);
+
+    let prompt_str = "こんにちは！あなたの名前は？";
+    println!("prompt_str: {}", &prompt_str);
+
     let tokens = tos
         .tokenizer()
         .encode(prompt_str, true)
         .map_err(anyhow::Error::msg)?;
     let tokens = tokens.get_ids();
-    let to_sample = args.sample_len.saturating_sub(1);
-    let mut all_tokens = vec![];
-    let mut logits_processor = {
-        let temperature = args.temperature;
-        let sampling = if temperature <= 0. {
-            Sampling::ArgMax
-        } else {
-            match (args.top_k, args.top_p) {
-                (None, None) => Sampling::All { temperature },
-                (Some(k), None) => Sampling::TopK { k, temperature },
-                (None, Some(p)) => Sampling::TopP { p, temperature },
-                (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
-            }
-        };
-        LogitsProcessor::from_sampling(args.seed, sampling)
-    };
+    let to_sample = sample_len.saturating_sub(1);
+    let mut logits_processor = LogitsProcessor::from_sampling(seed, Sampling::All { temperature });
 
     println!("logits_processor built");
 
+    println!("tokens: {:?}", tokens);
+
     let start_prompt_processing = std::time::Instant::now();
-    let mut next_token = if !args.split_prompt {
-        println!("split prompt");
+    let next_token =  {
         let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
+        println!("input: {:?}", input);
         let logits = model.forward(&input, 0)?;
+        println!("logits: {:?}", logits);
         let logits = logits.squeeze(0)?;
+        println!("logits: {:?}", logits);
         logits_processor.sample(&logits)?
-    } else {
-        println!("not split prompt");
-        let mut next_token = 0;
-        for (pos, token) in tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, pos)?;
-            let logits = logits.squeeze(0)?;
-            next_token = logits_processor.sample(&logits)?
-        }
-        next_token
     };
-    println!("next_token: {}", next_token);
-    let prompt_dt = start_prompt_processing.elapsed();
+
+    let mut all_tokens = vec![];
+    println!("tokens: {}", next_token);
     all_tokens.push(next_token);
     if let Some(t) = tos.next_token(next_token)? {
         print!("{t}");
-        std::io::stdout().flush()?;
+        std::io::stdout().flush()?;// ころっけに醤油をかける園田智代子
     }
+
     let eos_token = *tos
         .tokenizer()
         .get_vocab(true)
         .get("<|endoftext|>")
         .unwrap();
-    let start_post_prompt = std::time::Instant::now();
-    let mut sampled = 0;
-    for index in 0..to_sample {
-        let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, tokens.len() + index)?;
-        let logits = logits.squeeze(0)?;
-        let logits = if args.repeat_penalty == 1. {
-            logits
-        } else {
-            let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
-                &logits,
-                args.repeat_penalty,
-                &all_tokens[start_at..],
-            )?
-        };
-        next_token = logits_processor.sample(&logits)?;
-        all_tokens.push(next_token);
-        if let Some(t) = tos.next_token(next_token)? {
-            print!("{t}");
-            std::io::stdout().flush()?;
-        }
-        sampled += 1;
-        if next_token == eos_token {
-            break;
-        };
-    }
+    // let start_post_prompt = std::time::Instant::now();
+    // let mut sampled = 0;
+    // for index in 0..to_sample {
+    //     let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
+    //     let logits = model.forward(&input, tokens.len() + index)?;
+    //     let logits = logits.squeeze(0)?;
+    //     let logits = if args.repeat_penalty == 1. {
+    //         logits
+    //     } else {
+    //         let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
+    //         candle_transformers::utils::apply_repeat_penalty(
+    //             &logits,
+    //             args.repeat_penalty,
+    //             &all_tokens[start_at..],
+    //         )?
+    //     };
+    //     next_token = logits_processor.sample(&logits)?;
+    //     all_tokens.push(next_token);
+    //     if let Some(t) = tos.next_token(next_token)? {
+    //         print!("{t}");
+    //         std::io::stdout().flush()?;
+    //     }
+    //     sampled += 1;
+    //     if next_token == eos_token {
+    //         break;
+    //     };
+    // }
 
 
-    if let Some(rest) = tos.decode_rest().map_err(candle_core::Error::msg)? {
-        print!("{rest}");
-    }
+    // if let Some(rest) = tos.decode_rest().map_err(candle_core::Error::msg)? {
+    //     print!("{rest}");
+    // }
 
-    println!("before flush");
+    // println!("before flush");
 
-    std::io::stdout().flush()?;
-    let dt = start_post_prompt.elapsed();
-    println!(
-        "\n\n{:4} prompt tokens processed: {:.2} token/s",
-        tokens.len(),
-        tokens.len() as f64 / prompt_dt.as_secs_f64(),
-    );
-    println!(
-        "{sampled:4} tokens generated: {:.2} token/s",
-        sampled as f64 / dt.as_secs_f64(),
-    );
+    // std::io::stdout().flush()?;
+    // let dt = start_post_prompt.elapsed();
+    // println!(
+    //     "\n\n{:4} prompt tokens processed: {:.2} token/s",
+    //     tokens.len(),
+    //     tokens.len() as f64 / prompt_dt.as_secs_f64(),
+    // );
+    // println!(
+    //     "{sampled:4} tokens generated: {:.2} token/s",
+    //     sampled as f64 / dt.as_secs_f64(),
+    // );
     Ok(())
 }
