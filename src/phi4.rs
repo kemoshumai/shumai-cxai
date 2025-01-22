@@ -1,12 +1,13 @@
 use std::io::Write;
 
+use candle_core::backend::BackendDevice;
+use candle_examples::token_output_stream::TokenOutputStream;
 use tokenizers::Tokenizer;
 
-use candle_core::quantized::gguf_file;
+use candle_core::{quantized::gguf_file, CudaDevice};
 use candle_core::Tensor;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
-use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::models::quantized_phi3::ModelWeights as Phi3;
 
 #[derive(Debug)]
@@ -88,7 +89,7 @@ pub fn main() -> anyhow::Result<()> {
 
     let mut file = std::fs::File::open(&model_path)?;
     let start = std::time::Instant::now();
-    let device = candle_examples::device(cpu)?;
+    let device = candle_core::Device::Cuda(CudaDevice::new(0)?);
 
     let mut model = {
         let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
