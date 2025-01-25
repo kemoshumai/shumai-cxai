@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = "1.0.95"
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.8.2", features = ["cuda"] }
 candle-examples = { git = "https://github.com/huggingface/candle.git", version = "0.8.2" }
-candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.8.2" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.8.2", features = ["cuda"] }
 candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.8.2" }
 clap = "4.5.27"
 hf-hub = "0.4.1"
