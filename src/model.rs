@@ -1,4 +1,3 @@
-use std::io::Write;
 
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::{generation::{LogitsProcessor, Sampling}, models::quantized_phi3::ModelWeights};
@@ -69,7 +68,7 @@ impl Model {
         })
     }
 
-    pub fn run(&mut self, model_settings: ModelSettings, messages: &[Message]) -> anyhow::Result<()> {
+    pub fn run(&mut self, model_settings: ModelSettings, messages: &[Message]) -> anyhow::Result<ModelOutput> {
         let ModelSettings {
             temperature,
             repeat_penalty,
@@ -83,11 +82,14 @@ impl Model {
         let model = &mut self.model;
         let device = &mut self.device;
 
+        // トークナイザーを用意する
         let tokenizer = Tokenizer::from_file(hf_hub::api::sync::Api::new()?.model("microsoft/phi-4".to_string()).get("tokenizer.json")?).unwrap();
-        let mut tos = TokenOutputStream::new(tokenizer);
+        let tos = TokenOutputStream::new(tokenizer);
 
+        // メッセージを結合してプロンプト文字列を作成
         let prompt_str = messages.iter().map(Message::to_string).collect::<String>() + "<|im_start|>assistant<|im_sep|>";
 
+        // プロンプト文字列をトークン化
         let tokens = tos
             .tokenizer()
             .encode(prompt_str, true)
@@ -96,67 +98,121 @@ impl Model {
         let to_sample = sample_len.saturating_sub(1);
         let mut logits_processor = LogitsProcessor::from_sampling(seed, Sampling::TopKThenTopP { k, p, temperature } );
 
-        let mut next_token =  {
+        // 最初のトークンをサンプリング
+        let next_token =  {
             let input = Tensor::new(tokens, device)?.unsqueeze(0)?;
             let logits = model.forward(&input, 0)?;
             let logits = logits.squeeze(0)?;
             logits_processor.sample(&logits)?
         };
 
-        let mut all_tokens = vec![];
-        all_tokens.push(next_token);
-        if let Some(t) = tos.next_token(next_token)? {
-            print!("{t}");
-            std::io::stdout().flush()?;// ころっけに醤油をかける園田智代子
+        Ok(ModelOutput {
+            model,
+            to_sample: to_sample as usize,
+            eos_token: 0,
+            repeat_penalty,
+            repeat_last_n,
+            all_tokens: Vec::new(),
+            next_token,
+            device,
+            tokens: tokens.to_vec(),
+            logits_processor,
+            tos,
+            sampled: 0,
+            index: 0,
+            initial: true,
+            eos: false,
+        })
+    }
+}
+
+pub struct ModelOutput<'a> {
+    model: &'a mut ModelWeights,
+    to_sample: usize,
+    eos_token: u32,
+    repeat_penalty: f32,
+    repeat_last_n: usize,
+    all_tokens: Vec<u32>,
+    next_token: u32,
+    device: &'a mut candle_core::Device,
+    tokens: Vec<u32>,
+    logits_processor: LogitsProcessor,
+    tos: TokenOutputStream,
+    sampled: u64,// init this to 0
+    index: usize,
+    initial: bool,
+    eos: bool,
+}
+
+impl<'a> Iterator for ModelOutput<'a> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+
+        // 初回実行時の処理
+        if self.initial {
+            self.initial = false;
+
+            self.all_tokens = [self.next_token].to_vec();
+
+            let t = self.tos.next_token(self.next_token).unwrap();
+
+            // EOSトークンを取得
+            self.eos_token = *self.tos
+                .tokenizer()
+                .get_vocab(true)
+                .get("<|endoftext|>")
+                .unwrap();
+
+            // 初期化
+            self.sampled = 0;
+            self.index = 0;
+
+            return t;
         }
 
-        let eos_token = *tos
-            .tokenizer()
-            .get_vocab(true)
-            .get("<|endoftext|>")
-            .unwrap();
+        if self.index < self.to_sample && !self.eos {
 
-        let start_post_prompt = std::time::Instant::now();
-        let mut sampled = 0;
-        for index in 0..to_sample {
-            let input = Tensor::new(&[next_token], device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, tokens.len() + index as usize)?;
-            let logits = logits.squeeze(0)?;
-            let logits = if repeat_penalty == 1. {
-                logits
-            } else {
-                let start_at = all_tokens.len().saturating_sub(repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
-                    &logits,
-                    repeat_penalty,
-                    &all_tokens[start_at..],
-                )?
+            let mut f = || {
+                let input = Tensor::new(&[self.next_token], self.device).unwrap().unsqueeze(0).unwrap();
+                let logits = self.model.forward(&input, self.tokens.len() + self.index).unwrap();
+                self.index += 1;// indexを参照後にインクリメント
+                let logits = logits.squeeze(0).unwrap();
+                let logits = if self.repeat_penalty == 1. {
+                    logits
+                } else {
+                    let start_at = self.all_tokens.len().saturating_sub(self.repeat_last_n);
+                    candle_transformers::utils::apply_repeat_penalty(
+                        &logits,
+                        self.repeat_penalty,
+                        &self.all_tokens[start_at..],
+                    ).unwrap()
+                };
+                self.next_token = self.logits_processor.sample(&logits).unwrap();
+                self.all_tokens.push(self.next_token);
+
+                self.sampled += 1;
+
+                if self.next_token == self.eos_token {
+                    self.eos = true;
+                }
+
+                self.tos.next_token(self.next_token).unwrap()
             };
-            next_token = logits_processor.sample(&logits)?;
-            all_tokens.push(next_token);
-            if let Some(t) = tos.next_token(next_token)? {
-                print!("{t}");
-                std::io::stdout().flush()?;
+
+            let mut t = f();
+
+            while t.is_none() {
+                t = f();
             }
-            sampled += 1;
-            if next_token == eos_token {
-                break;
-            };
+
+            if let Some(t) = t {
+                return Some(t);
+            }
+
         }
 
+        self.tos.decode_rest().map_err(candle_core::Error::msg).unwrap()
 
-        if let Some(rest) = tos.decode_rest().map_err(candle_core::Error::msg)? {
-            print!("{rest}");
-        }
-
-        std::io::stdout().flush()?;
-        let dt = start_post_prompt.elapsed();
-        println!();
-        println!(
-            "{sampled:4} tokens generated: {:.2} token/s",
-            sampled as f64 / dt.as_secs_f64(),
-        );
-
-        Ok(())
     }
 }
