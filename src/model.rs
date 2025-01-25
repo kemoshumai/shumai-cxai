@@ -8,7 +8,7 @@ use candle_core::{quantized::gguf_file, Tensor};
 use candle_transformers::models::quantized_phi3::ModelWeights as Phi3;
 use tokenizers::Tokenizer;
 
-use crate::model_settings::ModelSettings;
+use crate::{message::Message, model_settings::ModelSettings};
 
 fn format_size(size_in_bytes: usize) -> String {
     if size_in_bytes < 1_000 {
@@ -69,7 +69,7 @@ impl Model {
         })
     }
 
-    pub fn run(&mut self, model_settings: ModelSettings) -> anyhow::Result<()> {
+    pub fn run(&mut self, model_settings: ModelSettings, messages: &[Message]) -> anyhow::Result<()> {
         let ModelSettings {
             temperature,
             repeat_penalty,
@@ -86,8 +86,7 @@ impl Model {
         let tokenizer = Tokenizer::from_file(hf_hub::api::sync::Api::new()?.model("microsoft/phi-4".to_string()).get("tokenizer.json")?).unwrap();
         let mut tos = TokenOutputStream::new(tokenizer);
 
-        let prompt_str = "こんにちは！1+1は田んぼの田ですか？";
-        println!("prompt_str: {}", &prompt_str);
+        let prompt_str = messages.iter().map(Message::to_string).collect::<String>() + "<|im_start|>assistant<|im_sep|>";
 
         let tokens = tos
             .tokenizer()

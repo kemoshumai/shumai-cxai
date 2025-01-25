@@ -17,7 +17,7 @@ impl Default for ModelSettings {
             k: 40,
             p: 0.95,
             seed: 42,
-            sample_len: 100u64,
+            sample_len: 4096u64,
         }
     }
 }
