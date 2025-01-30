@@ -289,4 +289,10 @@ impl ModelWeights {
         let xs = xs.apply(&self.output_norm)?.i((.., seq_len - 1, ..))?;
         self.output.forward(&xs)
     }
+
+    pub fn reset_kv_cache(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.kv_cache.reset()
+        }
+    }
 }

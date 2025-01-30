@@ -1,10 +1,10 @@
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::{generation::{LogitsProcessor, Sampling}, models::quantized_phi3::ModelWeights};
+use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use candle_core::{quantized::gguf_file, Tensor};
 
-use candle_transformers::models::quantized_phi3::ModelWeights as Phi3;
+use crate::quantized_phi3::ModelWeights as Phi3;
 use tokenizers::Tokenizer;
 
 use crate::{message::Message, model_settings::ModelSettings};
@@ -24,11 +24,12 @@ fn format_size(size_in_bytes: usize) -> String {
 
 pub struct Model {
     device: candle_core::Device,
-    model: ModelWeights,
+    global_pos: usize,
+    model: Phi3,
 }
 
 impl Model {
-    pub fn new(flash_attn: bool, cpu: bool) -> anyhow::Result<Self> {
+    pub fn new(cpu: bool) -> anyhow::Result<Self> {
 
         let model_path = hf_hub::api::sync::Api::new()?
             .repo(hf_hub::Repo::with_revision("microsoft/phi-4-gguf".to_string(),hf_hub::RepoType::Model,"main".to_string()))
@@ -54,7 +55,6 @@ impl Model {
                 start.elapsed().as_secs_f32(),
             );
             Phi3::from_gguf(
-                flash_attn,
                 model,
                 &mut file,
                 &device,
@@ -64,6 +64,7 @@ impl Model {
 
         Ok(Self {
             device,
+            global_pos: 0,
             model,
         })
     }
@@ -98,16 +99,26 @@ impl Model {
         let to_sample = sample_len.saturating_sub(1);
         let mut logits_processor = LogitsProcessor::from_sampling(seed, Sampling::TopKThenTopP { k, p, temperature } );
 
+        println!("global_pos: {}", self.global_pos);
+        println!("tokens: {:?}", tokens);
+
         // 最初のトークンをサンプリング
         let next_token =  {
             let input = Tensor::new(tokens, device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, 0)?;
+
+            self.global_pos = 0;
+            model.reset_kv_cache();
+
+            let logits = model.forward(&input, self.global_pos)?;
             let logits = logits.squeeze(0)?;
             logits_processor.sample(&logits)?
         };
 
+        self.global_pos += tokens.len();
+
         Ok(ModelOutput {
             model,
+            global_pos: &mut self.global_pos,
             to_sample: to_sample as usize,
             eos_token: 0,
             repeat_penalty,
@@ -115,7 +126,6 @@ impl Model {
             all_tokens: Vec::new(),
             next_token,
             device,
-            tokens: tokens.to_vec(),
             logits_processor,
             tos,
             sampled: 0,
@@ -127,7 +137,8 @@ impl Model {
 }
 
 pub struct ModelOutput<'a> {
-    model: &'a mut ModelWeights,
+    model: &'a mut Phi3,
+    global_pos: &'a mut usize,
     to_sample: usize,
     eos_token: u32,
     repeat_penalty: f32,
@@ -135,7 +146,6 @@ pub struct ModelOutput<'a> {
     all_tokens: Vec<u32>,
     next_token: u32,
     device: &'a mut candle_core::Device,
-    tokens: Vec<u32>,
     logits_processor: LogitsProcessor,
     tos: TokenOutputStream,
     sampled: u64,// init this to 0
@@ -175,8 +185,8 @@ impl<'a> Iterator for ModelOutput<'a> {
 
             let mut f = || {
                 let input = Tensor::new(&[self.next_token], self.device).unwrap().unsqueeze(0).unwrap();
-                let logits = self.model.forward(&input, self.tokens.len() + self.index).unwrap();
-                self.index += 1;// indexを参照後にインクリメント
+                let logits = self.model.forward(&input, *self.global_pos).unwrap();
+                *self.global_pos += 1;// indexを参照後にインクリメント
                 let logits = logits.squeeze(0).unwrap();
                 let logits = if self.repeat_penalty == 1. {
                     logits
@@ -211,6 +221,8 @@ impl<'a> Iterator for ModelOutput<'a> {
             }
 
         }
+
+        *self.global_pos += 1;
 
         self.tos.decode_rest().map_err(candle_core::Error::msg).unwrap()
 
