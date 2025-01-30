@@ -99,9 +99,6 @@ impl Model {
         let to_sample = sample_len.saturating_sub(1);
         let mut logits_processor = LogitsProcessor::from_sampling(seed, Sampling::TopKThenTopP { k, p, temperature } );
 
-        println!("global_pos: {}", self.global_pos);
-        println!("tokens: {:?}", tokens);
-
         // 最初のトークンをサンプリング
         let next_token =  {
             let input = Tensor::new(tokens, device)?.unsqueeze(0)?;
