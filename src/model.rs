@@ -156,6 +156,10 @@ impl<'a> Iterator for ModelOutput<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
 
+        if self.eos {
+            return None;
+        }
+
         // 初回実行時の処理
         if self.initial {
             self.initial = false;
@@ -181,6 +185,10 @@ impl<'a> Iterator for ModelOutput<'a> {
         if self.index < self.to_sample && !self.eos {
 
             let mut f = || {
+
+                if self.eos {
+                    return (None, true);
+                }
                 let input = Tensor::new(&[self.next_token], self.device).unwrap().unsqueeze(0).unwrap();
                 let logits = self.model.forward(&input, *self.global_pos).unwrap();
                 *self.global_pos += 1;// indexを参照後にインクリメント
@@ -200,23 +208,29 @@ impl<'a> Iterator for ModelOutput<'a> {
 
                 self.sampled += 1;
 
-                if self.next_token == self.eos_token {
-                    self.eos = true;
-                }
+                let eos = self.next_token == self.eos_token;
 
-                self.tos.next_token(self.next_token).unwrap()
+                (self.tos.next_token(self.next_token).unwrap(), eos)
             };
 
-            let mut t = f();
+            let (mut t, mut eos) = f().clone();
 
-            while t.is_none() {
-                t = f();
+            while t.is_none() && !eos {
+                let (t_, eos_) = f();
+                t = t_;
+                eos = eos_;
             }
+
+            self.eos = eos;
 
             if let Some(t) = t {
                 return Some(t);
             }
 
+        }
+
+        if self.eos {
+            return None;
         }
 
         *self.global_pos += 1;
